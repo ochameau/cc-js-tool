@@ -1,0 +1,40 @@
+<html>
+<script src="/home/alex/dump.json"></script>
+<script>
+window.onload = function () {
+
+for (var key in data.globals) {
+  delete data.globals[key].objects;
+  data.globals[key].cross = [];
+}
+
+var windowKey = "0x7fdd22116060";
+for (var key1 in data.graph) {
+  var o1 = data.graph[key1];
+  var cmpt = o1.cmpt;
+  if (o1.global != windowKey)
+    continue;
+  o1.owners.forEach(function (e) {
+    var key2 = e.key;
+    var o2 = data.graph[key2];
+    if (o2.cmpt != cmpt) {
+      var gKey1 = o1.global ? o1.global : key1;
+      var gKey2 = o2.global ? o2.global : key2;
+      if (!data.globals[gKey1] || !data.globals[gKey2]) {
+        // Various JS Script nodes don't have any parent
+        return;
+      }
+      if (data.globals[gKey1].cross.indexOf(gKey2)==-1)
+//      data.globals[gKey1].cross.push(gKey2);
+      data.globals[gKey1].cross.push({owner:key2, owned:key1, global:gKey2, name: e.name});
+    }
+  });
+}
+
+document.body.innerHTML = "<pre>" + JSON.stringify(data.globals, null, 2) + "</pre>";
+
+}
+</script>
+<body></body>
+</html>
+
