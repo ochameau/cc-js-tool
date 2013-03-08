@@ -1,4 +1,3 @@
-
 const { Cu, Ci, Cc } = require("chrome");
 const { setTimeout, setInterval } = require("timer");
 const { CCAnalyzer } = require("cc-analyzer");
@@ -7,16 +6,18 @@ const inspect = require("js-inspect");
 
 const globalScope = this;
 
-Cu.import("resource://gre/modules/Services.jsm");
+let {TextEncoder} = Cu.import("resource://gre/modules/Services.jsm");
 Cu.import("resource://gre/modules/ctypes.jsm");
+Cu.import("resource://gre/modules/osfile.jsm")
 
+const verbose = false;
 
 function areSamePointer(a, b) {
   return String(a) == String(b);
 }
 
 function getPathToGlobal(o, path) {
-  if (o.name != "JS Object (Object)")
+  if (o.name != "JS Object (Object)" && o.name != "JS Object (Function)")
     return null;
   let addr = jsapi.getPointerForAddress(o.address);
   let originalAddr = addr;
@@ -25,7 +26,6 @@ function getPathToGlobal(o, path) {
     if (path)
       path.push(addr);
     let parent = jsapi.JS_GetParent(addr);
-    // Use parseInt as jsctypes returns an object which is always true...
     if (parent.isNull())
       break;
     addr = parent;
@@ -46,22 +46,43 @@ function getFragments(analyzer) {
   return fragments;
 }
 
+let msgs = [];
+function log(msg) {
+  console.log(msg);
+  msgs.push(msg);
+}
+function flushLog() {
+  let encoder = new TextEncoder();
+  let array = encoder.encode(msgs.join('\n'));
+  let path = OS.Path.join(OS.Constants.Path.tmpDir, "mem-" + new Date().getTime() + ".log");
+  let promise = OS.File.writeAtomic(path, array, {tmpPath: "file.txt.tmp"});
+  promise.then(function () {
+    let file = Cc["@mozilla.org/file/local;1"].
+               createInstance(Ci.nsILocalFile);
+    file.initWithPath(path);
+    file.reveal();
+  });
+}
+
 function main() {
+  msgs = [];
   inspect.getEnv(function (rt, cx, obj, analyzer) {
     let fragments = getFragments(analyzer);
     if (fragments.length == 0) {
-      //return console.log(" << no leak >> ");
+      log(" << no suspicious fragment leak >> ");
+      flushLog();
+      return;
     }
 
-    console.log("Suspicious fragments: " + fragments.join(', '));
+    log("Suspicious fragments: " + fragments.join(', '));
 
     // Get a full CC graph
     let analyzerGC = new CCAnalyzer(true);
     analyzerGC.run(function () {
-      console.log("# objects in CC: " + Object.keys(analyzerGC.graph).length);
-      if (fragments.length == 0)
-        return;
+      log("# objects in CC: " + Object.keys(analyzerGC.graph).length);
       analyzeCompleteGraph(cx, analyzerGC, fragments);
+
+      flushLog();
     });
 
   });
@@ -127,29 +148,43 @@ function getWrappers(analyzer, objects) {
       if (e.from.compartment && e.from != o &&
           !areSamePointer(e.from.compartment, o.compartment) &&
           !wrappers.some(function (a) {return a.dst == e.from}))
-        wrappers.push({src:o, dst:e.from, link: e.name});
+        wrappers.push({src:o, dst:e.from, link: e.name, kind: "owner"});
     });
-    
     o.edges.forEach(function (e) {
       if (e.to.compartment && e.to != o &&
           !areSamePointer(e.to.compartment, o.compartment) &&
           !wrappers.some(function (a) {return a.dst == e.to}))
-        wrappers.push({src:o, dst:e.to, link: "EDGE: "+e.name});
+        wrappers.push({src:o, dst:e.to, link: "EDGE: "+e.name, kind: "edge"});
     });
-    
   });
   return wrappers;
+}
+
+function getEdgeWithName(obj, name) {
+  for (let i = 0; i < obj.edges.length; i++) {
+    let e = obj.edges[i];
+    if (e.name == name)
+      return e.to;
+  }
+}
+
+function getOwnerWithName(obj, name) {
+  for (let i = 0; i < obj.owners.length; i++) {
+    let e = obj.owners[i];
+    if (e.name == name)
+      return e.from;
+  }
 }
 
 function analyzeCompleteGraph(cx, analyzer, fragments) {
 
   // Assume all fragments are only in the same compartment
   let compartment = getGCThingCompartment(cx, analyzer.graph[fragments[0]]);
-  console.log(" # compartments: " + compartment);
+  log(" # compartments: " + compartment);
 
   computeGraphCompartments(cx, analyzer);
   let cmptObjects = getCompartmentObjects(analyzer, compartment);
-  console.log(" # objects for this compartment: " + cmptObjects.length);
+  log(" # objects for this compartment: " + cmptObjects.length);
 
   let firstObject;
   cmptObjects.some(function (obj) {
@@ -166,46 +201,77 @@ function analyzeCompleteGraph(cx, analyzer, fragments) {
 
   // Get all wrappers that reference objects from our leaked compartment
   let wrappers = getWrappers(analyzer, cmptObjects);
-  console.log(" # wrappers: " + wrappers.length);
+  log(" # wrappers: " + wrappers.length);
 
   let leaks = wrappers;
 
   //let leaks = getCrossCompartmentObjects(cx, analyzer, fragments);
 
   leaks.forEach(function (leak) {
-    console.log("\n\n############################################################################");
-    console.log("link edge name: "+leak.link);
-    console.log(" --- LEAK TARGET");
-    if (leak.src.name == "JS Object (Proxy)") {
-      let target;
-      leak.src.edges.some(function (e) {
-        if (e.name == "private") {
-          target = e.to;
-          return true;
-        }
-        return false;
-      });
-      dumpObjectEdges("{{EDGES}}", leak.src);
-      if (leak.src.owners.length == 1)
-        dumpObject(cx, "{{OWNER}}", leak.src.owners[0].from);
+    log("\n\n############################################################################");
 
+    // First detect typical leak pattern in order to print explicit message
+    if (leak.kind == "edge") {
+      if (leak.src.name == "JS Object (Proxy)") {
+        // Detect leaky DOM listener set between two compartments
+        if (leak.src.owners.length == 1 &&
+            leak.src.owners[0].name == "mJSObj" &&
+            leak.src.owners[0].from.name == "nsXPCWrappedJS (nsIDOMEventListener)") {
+          log("DOM Listener leak.");
+          let target = getEdgeWithName(leak.src, "private");
+          dumpObject(cx, "Leaked listener", target);
+
+          let eventListener = leak.src.owners[0].from;
+          let listenerManager = getOwnerWithName(eventListener, "mListeners[i]");
+          listenerManager.owners.forEach(function (e) {
+            dumpObject(cx, "DOM Event target holding the listener", e.from);
+          });
+          return;
+        }
+      }
+    }
+
+    if (leak.kind == "owner") {
+      // Detect leaks related to a scoped variable being binded for a function
+      let scopeObjects = leak.dst.owners.filter(function (e) {
+        return e.from.name == "JS Object (Call)";
+      });
+      let leakyFunctions = scopeObjects.map(function (e) {
+        return {fun: getOwnerWithName(e.from, "fun_callscope"),
+                varName: e.name};
+      });
+      if (leakyFunctions.length > 0) {
+        log("Scope variable leak.");
+        leakyFunctions.forEach(function (e) {
+          dumpObject(cx, "Function keeping '"+e.varName+"' scope variable alive", e.fun);
+        });
+      }
+      return;
+    }
+    log(" --- Object in leaked compartment (leaked object):");
+    if (leak.src.name == "JS Object (Proxy)") {
+      target = getEdgeWithName(leak.src, "private");
       dumpObject(cx, "proxy for", target);
+      dumpObjectEdges("{{proxy-EDGES}}", leak.src);
+      if (leak.src.owners.length == 1)
+        dumpObject(cx, "{{proxy-OWNER}}", leak.src.owners[0].from);
+      let target = getEdgeWithName(leak.src, "private");
     }
     else {
       dumpObject(cx, "src", leak.src);
     }
 
-    console.log(" --- LEAK SOURCE");
+    log(" --- Object in another compartment (leak cause):");
     if (leak.dst.name == "JS Object (Proxy)") {
+      dumpObjectEdges("{{proxy-EDGES}}", leak.dst);
       leak.dst.owners.forEach(function (e) {
-        dumpObject(cx, "owner." + e.name, e.from);
+        dumpObject(cx, "proxy-owner." + e.name, e.from);
       });
     }
     else {
-      console.log("source isn't a proxy ?!");
+      log("source isn't a proxy ?!");
       dumpObject(cx, "leak source", leak.dst);
     }
-
 });
 }
 
@@ -216,7 +282,7 @@ function dumpObjectEdges(description, obj) {
     if (e.to.name.indexOf("JS Object (Object") == 0) {
       g2 = getPathToGlobal(e.to, []);
     }
-    console.log(" * " + description + ".edge." + e.name + " " + 
+    log(" * " + description + ".edge." + e.name + " " + 
                 o2 + "=" + e.to.name + 
                 (g2 ? " global:" + g2 : ""));
   });
@@ -226,7 +292,7 @@ function dumpObjectEdges(description, obj) {
     if (e.from.name.indexOf("JS Object (Object") == 0) {
       g2 = getPathToGlobal(e.from, []);
     }
-    console.log(" * " + description + ".owner." + e.name + " " + 
+    log(" * " + description + ".owner." + e.name + " " + 
                 o2 + "=" + e.from.name + 
                 (g2 ? " global:" + g2 : ""));
   });
@@ -234,8 +300,8 @@ function dumpObjectEdges(description, obj) {
 
 function dumpObject(cx, description, leak) {
   let obj = jsapi.getPointerForAddress(leak.address);
-  console.log("");
-  console.log(">>> " + description + " " + obj + " - "+leak.name);
+  log("");
+  log(">>> " + description + " " + obj + " - "+leak.name);
 
   // In case of proxy, dump the target object
   if (leak.name == "JS Object (Proxy)") {
@@ -257,12 +323,30 @@ function dumpObject(cx, description, leak) {
     }
   }
 
+  // There is enough information in fragment class name...
+  if (leak.name.indexOf("FragmentOrElement") == 0)
+    return;
+
+  // When using bind for ex, the binded function because a native method
+  // so that we won't be able to decompile the function source.
+  // The original function is eventually stored in 'parent' edge.
+  // Otherwise, parent is just the global object.
+  if (leak.name.indexOf("JS Object (Function") == 0) {
+    let parent = getEdgeWithName(leak, "parent");
+    if (parent.name.indexOf("JS Object (Function") == 0) {
+      log("Binded function for:");
+      dumpObject(cx, "Function parent", parent);
+      return;
+    }
+  }
+
   if (leak.name == "JS Object (ChromeWindow)" ||
       leak.name == "JS Object (Window)" ||
       leak.name == "Backstagepass" ||
       leak.name == "Sandbox") {
     let d = inspect.getGlobalDescription(cx, obj);
-    console.log(" * global desc: "+JSON.stringify(d));
+    log("Global description:")
+    log(JSON.stringify(d, null, 2));
     return;
   }
 
@@ -296,6 +380,11 @@ function dumpObject(cx, description, leak) {
     return;
   }
 
+  if (leak.name.indexOf("JS Object (Function") == 0)
+    log("Function source:\n" + jsapi.stringifyFunction(cx, obj));
+  
+  if (!verbose)
+    return;
   let path = [];
   let global = getPathToGlobal(leak, path);
   let paths = path.map(function (o) {
@@ -307,20 +396,11 @@ function dumpObject(cx, description, leak) {
       enum: jsapi.enumerate(cx, o)
     };
   });
-  console.log(" * global: "+global);
+  log(" * global: "+global);
   if (global)
-    console.log(" * global desc: "+JSON.stringify(inspect.getGlobalDescription(cx, global)));
-  /*
-  console.log(" * leak to global path: \n" + JSON.stringify(paths, null, 4));
-  let leakPath = leak.leakPath.map(function (o) {
-    return {
-      self: o.obj.address,
-      edgeName: o.link,
-      name: o.obj.name
-    };
-  });
-  console.log(" * fragment to leak path:\n" + JSON.stringify(leakPath, null, 4));
-  */
+    log(" * global description: " +
+                JSON.stringify(inspect.getGlobalDescription(cx, global)));
+
   let n=0;
   let nMax = 100;
   leak.edges.forEach(function (e) {
@@ -330,7 +410,7 @@ function dumpObject(cx, description, leak) {
       if (n++>nMax) return;
       g2 = getPathToGlobal(e.to, []);
     }
-    console.log(" * edge." + e.name + " " + o2 + "=" + e.to.name + (g2?" global:"+g2:""));
+    log(" * edge." + e.name + " " + o2 + "=" + e.to.name + (g2?" global:"+g2:""));
   });
   n=0;
   leak.owners.forEach(function (e) {
@@ -340,14 +420,18 @@ function dumpObject(cx, description, leak) {
       if (n++>nMax) return;
       g2 = getPathToGlobal(e.from, []);
     }
-    console.log(" * owner." + e.name + " " + o2 + "=" + e.from.name + (g2?" global:"+g2:""));
+    log(" * owner." + e.name + " " + o2 + "=" + e.from.name + (g2?" global:"+g2:""));
   });
-  console.log(" * enum: \n" + JSON.stringify(jsapi.enumerate(cx, obj), null, 4));
-  console.log(" * name: " + jsapi.getPropertyString(cx, obj, "name"));
-  if (leak.name.indexOf("JS Object (Function") == 0)
-    console.log(" * function source:\n"+jsapi.stringifyFunction(cx, obj));
-  console.log("<<<");
+  log(" * enum: \n" + JSON.stringify(jsapi.enumerate(cx, obj), null, 4));
+  log(" * name: " + jsapi.getPropertyString(cx, obj, "name"));
+  log("<<<");
 }
 
-setTimeout(main, 5000);
-
+// Register a keyshortcut for running mem dump
+const WM = Cc['@mozilla.org/appshell/window-mediator;1'].
+           getService(Ci.nsIWindowMediator);
+let win = WM.getMostRecentWindow("navigator:browser")
+win.addEventListener("keyup", function (e) {
+  if (e.altKey && String.fromCharCode(e.keyCode) == "D")
+    main();
+});

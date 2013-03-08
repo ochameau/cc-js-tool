@@ -23,18 +23,18 @@ let JSCompartment = ctypes.StructType("JSCompartment").ptr;
 let JSRuntime = ctypes.StructType("JSRuntime").ptr;
 let JSContext = ctypes.StructType("JSContext").ptr;
 let JSObject = CppClass("JSObject").ptr;
-let JSObjectPtr = CppClass("JSObject").ptr.ptr;
+// On windows, JSRawObject is a distinct type regarding mangling,
+// but still with the same class name
+let JSRawObject = CppClass("JSObject").ptr;
 let JSFunction = CppClass("JSFunction").ptr;
 
 let JSString = CppClass("JSString").ptr;
 let JSIdArray = ctypes.StructType("JSIdArray").ptr;
-let jsid, newjsid;
+let jsid;
 if (ARCH == "x86") {
   jsid = ctypes.int;
-  newjsid = jsid;
 } else if (ARCH == "x86_64") {
   jsid = ctypes.long;
-  newjsid = jsid;
 } else {
   throw new Error("Unsupported arch: "+ARCH);
 }
@@ -43,13 +43,14 @@ try {
   declare(lib, "JS_WrapId", ctypes.bool, JSContext, jsid.ptr);
 } catch(e) {
   jsid = CppClass("jsid");
-  newjsid = jsid.ctype;
   try {
     declare(lib, "JS_WrapId", ctypes.bool, JSContext, jsid.ptr);
   } catch(e) {
     throw new Error("Unable to detect jsid type." + e);
   }
 }
+// If jsctypes isn't a class, it won't have create method
+let createJsid = jsid.create ? jsid.create : jsid;
 
 let jsval = CppClass("JS::Value");
 
@@ -69,7 +70,7 @@ const JSTYPE_LIMIT = 8;
 
 let JS_GetParent = declare(lib, "JS_GetParent",
   JSObject,
-  JSObject);
+  JSRawObject);
 
 let JS_GetObjectRuntime = declare(lib, "JS_GetObjectRuntime",
   JSRuntime,
@@ -77,7 +78,7 @@ let JS_GetObjectRuntime = declare(lib, "JS_GetObjectRuntime",
 
 let JS_GetGlobalForObject = declare(lib, "JS_GetGlobalForObject",
   JSObject,
-  JSContext, JSObject);
+  JSContext, JSRawObject);
 
 let JS_GetGlobalForCompartmentOrNull = declare(lib, "JS_GetGlobalForCompartmentOrNull",
   JSObject,
@@ -114,7 +115,7 @@ let JS_ValueToObject = declare(lib, "JS_ValueToObject",
   ctypes.bool,
   JSContext,
   jsval,
-  JSObjectPtr);
+  JSObject.ptr);
 
 let JS_ValueToFunction = declare(lib, "JS_ValueToFunction",
   JSFunction,
@@ -197,6 +198,7 @@ let JS_GetClass = declare(lib, "JS_GetClass",
   JSClass.ptr,
   JSObject);
 
+/*
 let JSIterateCompartmentCallback = ctypes.FunctionType(ctypes.default_abi,
   ctypes.void_t,
   [JSRuntime,
@@ -208,7 +210,7 @@ let JS_IterateCompartments = declare(lib, "JS_IterateCompartments",
   JSRuntime,
   ctypes.voidptr_t,
   JSIterateCompartmentCallback.ptr);
-
+*/
 let constCharPtr = Const(ctypes.char, true);
 let JS_EvaluateScript = declare(lib, "JS_EvaluateScript",
   ctypes.bool,
@@ -226,7 +228,7 @@ let JS_EvaluateScript = declare(lib, "JS_EvaluateScript",
 function getPointerForAddress(addr) {
   // On 32bit, the address given by nsICycleCollector
   // is prefixed with FFFFFFFF, we should remove them.
-  // It's due to a bug of %llx with uint64_t on 32bit.
+  // It's seems to be due to a bug of %llx with uint64_t on 32bit.
   if (ctypes.voidptr_t.size == 4 && addr.length == 18)
     addr = addr.replace("0xffffffff", "0x");
     
@@ -318,6 +320,7 @@ function enumerate(cx, obj) {
     let jsid = JS_IdArrayGet(cx, arr, i);
     let idval = jsval.create();
     rv = JS_IdToValue(cx, jsid, idval.address());
+
     let str = JS_ValueToString(cx, idval);
     let len = ctypes.size_t(0);
     let propname = JS_GetStringCharsAndLength(cx, str, len.address());
@@ -351,7 +354,7 @@ function getPropertyString(cx, obj, name) {
 
   let v = jsval.create();
   let rv = JS_LookupProperty(cx, obj, name, v.address());
-
+  
   let type = JS_TypeOfValue(cx, v);
   if (type == JSTYPE_FUNCTION) {
     JS_LeaveCompartment(cx, oldCmpt);
@@ -388,7 +391,7 @@ function getPropertyObject(cx, obj, name) {
 
 function stringifyFunction(cx, obj) {
   let oldCmpt = JS_EnterCompartment(cx, obj)
-  let id = jsid.create();
+  let id = createJsid(0);
   let rv = JS_GetObjectId(cx, obj, id.address());
   let val = jsval.create();
   rv = JS_IdToValue(cx, id, val.address());
@@ -409,12 +412,14 @@ function stringifyFunction(cx, obj) {
     console.log("getstrchar "+funnameidstr);
   }
   */
-  let source = JS_DecompileFunction(cx, jsfun, 2);
-  if (!source.isNull()) {
-    let len = ctypes.size_t(0);
-    let srcstr = JS_GetStringCharsAndLength(cx, source, len.address());
-    JS_LeaveCompartment(cx, oldCmpt);
-    return srcstr.readString();
+  if (!jsfun.isNull()) {
+    let source = JS_DecompileFunction(cx, jsfun, 2);
+    if (!source.isNull()) {
+      let len = ctypes.size_t(0);
+      let srcstr = JS_GetStringCharsAndLength(cx, source, len.address());
+      JS_LeaveCompartment(cx, oldCmpt);
+      return srcstr.readString();
+    }
   }
   JS_LeaveCompartment(cx, oldCmpt);
   return null;

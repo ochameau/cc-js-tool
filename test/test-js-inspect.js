@@ -37,8 +37,11 @@ exports["test listing all globals"] = function (assert, done) {
 
 exports["test eval"] = function (assert, done) {
   inspect.getEnv(function (rt, cx, obj) {
-    let json = inspect.eval(cx, obj, "return this;");
-    console.log(">> "+JSON.stringify(json));
+    console.log(">> "+cx+"/"+obj);
+    let parent = api.JS_GetParent(obj);
+    console.log("parent: "+parent);
+    let json = inspect.eval(cx, obj, "return 'foo';");
+    console.log(">eval> "+JSON.stringify(json));
   });
 }
 

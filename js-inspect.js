@@ -41,25 +41,27 @@ function getGlobalDescription(cx, global) {
   let oldCmpt = api.JS_EnterCompartment(cx, global);
   let name = api.getClassName(global);
   let desc = {
-    self: global,
-    name: name,
+    self: global
   };
   if (name == "BackstagePass") {
-    desc.xpcom = "" + api.getPropertyString(cx, global, "__URI__");
+    desc.kind = "xpcom";
+    desc.xpcom = api.getPropertyString(cx, global, "__URI__");
   }
   else if (name == "Sandbox") {
     let m = api.getPropertyObject(cx, global, "module");
-    // Only way I found to ensure that `m` isn't a null pointer:
     if (!m.isNull()) {
+      desc.kind = "module";
       desc.module = {
-        uri: "" + api.getPropertyString(cx, m, "uri"),
-        id: "" + api.getPropertyString(cx, m, "id")
+        uri: api.getPropertyString(cx, m, "uri"),
+        id: api.getPropertyString(cx, m, "id")
       };
     } else {
+      desc.kind = "unknown";
       desc.attrs = api.enumerate(cx, global);
     }
   }
   else if (name == "Window" || name == "ChromeWindow") {
+    desc.kind = "window";
     desc.window = String(api.getPropertyString(cx, global, "location"));
     // For some reason, some ChromeWindow end up return "true" string here ...
     if (desc.window === "true") {
@@ -69,6 +71,8 @@ function getGlobalDescription(cx, global) {
     }
   }
   else {
+    desc.kind = "unknown";
+    desc.name = name;
     desc.attrs = api.enumerate(cx, global);
   }
 
@@ -82,7 +86,6 @@ function eval(cx, obj, jsCode) {
   let oldCmpt = api.JS_EnterCompartment(cx, obj);
   let result = api.jsval.create();
   jsCode = "JSON.stringify((function () {" + jsCode + "})())";
-  console.log(obj+" / "+result.address());
   let rv = api.JS_EvaluateScript(cx, obj, jsCode, jsCode.length, "", 1, result.address());
   if (!rv)
     return "";
@@ -98,4 +101,3 @@ function eval(cx, obj, jsCode) {
   }
 }
 exports.eval = eval;
-
