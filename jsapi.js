@@ -3,6 +3,7 @@ const { CppClass, Const, Enum, declare } = require("jscpptypes");
 
 Cu.import("resource://gre/modules/ctypes.jsm");
 
+
 const { XPCOMABI } = Cc["@mozilla.org/xre/app-info;1"].getService(Ci.nsIXULRuntime);
 const ARCH = XPCOMABI.split("-")[0]; // x86, x86_64
 
@@ -50,7 +51,7 @@ try {
   }
 }
 // If jsctypes isn't a class, it won't have create method
-let createJsid = jsid.create ? jsid.create : jsid;
+let createJsid = jsid.create ? jsid.create.bind(jsid) : jsid;
 
 let jsval = CppClass("JS::Value");
 

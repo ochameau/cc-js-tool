@@ -17,7 +17,7 @@ function areSamePointer(a, b) {
 }
 
 function getPathToGlobal(o, path) {
-  if (o.name != "JS Object (Object)" && o.name != "JS Object (Function)")
+  if (o.name != "JS Object (Object)" && o.name.indexOf("JS Object (Function") == -1)
     return null;
   let addr = jsapi.getPointerForAddress(o.address);
   let originalAddr = addr;
@@ -102,7 +102,7 @@ function getCrossCompartmentObjects(cx, analyzer, sourceObjects) {
   return cross;
 }
 
-function getGCThingCompartment(cx, o) {
+function getGCThingCompartmentNGlobal(cx, o) {
   let found = null;
   o.owners.some(function (e) {
     if (e.from == o)
@@ -110,10 +110,11 @@ function getGCThingCompartment(cx, o) {
     if (e.from.name.indexOf("JS Object (") == 0) {
       let obj = jsapi.getPointerForAddress(e.from.address);
       let c = jsapi.GetObjectCompartment(cx, obj);
-      found = c;
+      let global = getPathToGlobal(e.from, []);
+      found = [c, global];
       return true;
     }
-    found = getGCThingCompartment(cx, e.from);
+    found = getGCThingCompartmentNGlobal(cx, e.from);
     if (found)
       return true;
   });
@@ -178,9 +179,30 @@ function getOwnerWithName(obj, name) {
 
 function analyzeCompleteGraph(cx, analyzer, fragments) {
 
+  let compartmentsGlobal = {};
+  let compartments = fragments.reduce(function (l, f) {
+    let o = analyzer.graph[f];
+    log(" # fragment : " + o.name);
+    let [cmpt, global] = getGCThingCompartmentNGlobal(cx, o);
+    if (l.indexOf(cmpt) == -1) {
+      l.push(cmpt);
+      compartmentsGlobal[cmpt] = global;
+    }
+    return l;
+  }, []);
+
   // Assume all fragments are only in the same compartment
-  let compartment = getGCThingCompartment(cx, analyzer.graph[fragments[0]]);
-  log(" # compartments: " + compartment);
+  let compartment = compartments[0];
+  log(" # compartments: " + compartments.length + " - "+compartment);
+  /*
+  let globals = compartments.map(function (c) {
+    let global = compartmentsGlobal[c];
+    let desc = inspect.getGlobalDescription(cx, global);
+    if (desc)
+      return JSON.stringify(desc, null, 2);
+  });
+  log(" globals: " + globals);
+  */
 
   computeGraphCompartments(cx, analyzer);
   let cmptObjects = getCompartmentObjects(analyzer, compartment);
@@ -380,9 +402,15 @@ function dumpObject(cx, description, leak) {
     return;
   }
 
-  if (leak.name.indexOf("JS Object (Function") == 0)
+  if (leak.name.indexOf("JS Object (Function") == 0) {
+    let global = getPathToGlobal(leak, []);
+    log(" * global: " + global);
+    if (global)
+      log(" * global description: " +
+                  JSON.stringify(inspect.getGlobalDescription(cx, global)));
     log("Function source:\n" + jsapi.stringifyFunction(cx, obj));
-  
+  }
+
   if (!verbose)
     return;
   let path = [];
@@ -435,3 +463,4 @@ win.addEventListener("keyup", function (e) {
   if (e.altKey && String.fromCharCode(e.keyCode) == "D")
     main();
 });
+
